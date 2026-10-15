@@ -8,16 +8,46 @@
 # position. Afterwards all hunks anchor exactly.
 #
 # Usage: refresh-fuzz.py <workdir>
-#   <workdir> must contain the pristine trees (linux-6.12.112/,
-#   backports-6.18.55/) -- e.g. a check-patches.sh run directory.
+#   <workdir> must contain the pristine trees (linux-<kver>/,
+#   backports-<bver>/) -- e.g. a check-patches.sh run directory.
+#   Versions are auto-detected from the tree (works on 24.10 and 25.12).
 
 import os, re, shutil, subprocess, sys
 
 WORK = os.path.abspath(sys.argv[1])
 REPO = os.path.abspath(os.path.dirname(os.path.abspath(__file__)) + '/..')
-PATCHES = REPO + '/target/linux/qualcommax/patches-6.12'
 GENERIC = REPO + '/target/linux/generic'
 MAC = REPO + '/package/kernel/mac80211/patches'
+
+def detect_kver(repo):
+    """内核完整版本号(如 6.6.157 / 6.12.112),兼容新旧两种版本文件布局。"""
+    cands = []
+    for prio, d in ((0, 'target/linux/generic'), (1, 'include')):
+        p = os.path.join(repo, d)
+        if os.path.isdir(p):
+            for f in os.listdir(p):
+                m = re.match(r'kernel-(\d+\.\d+)$', f)
+                if m:
+                    cands.append((prio, m.group(1), os.path.join(p, f)))
+    if not cands:
+        raise RuntimeError('kernel version file not found')
+    _, mm, vf = sorted(cands)[0]
+    txt = open(vf, encoding='utf-8', errors='replace').read()
+    m = re.search(r'=\s*\.(\d+)', txt)          # 旧布局: LINUX_VERSION-6.6 = .157
+    if m:
+        return mm + '.' + m.group(1)
+    m = re.search(r'(\d+\.\d+\.\d+)', txt)      # 新布局: 6.12.112
+    if m:
+        return m.group(1)
+    raise RuntimeError('cannot parse kernel version from ' + vf)
+
+def detect_bver(repo):
+    mk = open(repo + '/package/kernel/mac80211/Makefile',
+              encoding='utf-8', errors='replace').read()
+    m = re.search(r'^PKG_VERSION\s*:?=\s*(\S+)', mk, re.M)
+    if not m:
+        raise RuntimeError('mac80211 PKG_VERSION not found')
+    return m.group(1)
 
 def run(cmd, cwd=None, check=False):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -148,15 +178,21 @@ def process(tree, chain_dirs):
 
 def main():
     DL = REPO + '/dl'
+    kver = detect_kver(REPO)
+    mm = '.'.join(kver.split('.')[:2])
+    bver = detect_bver(REPO)
+    print('kernel %s / backports %s' % (kver, bver))
+
     # ---- 内核链 ----
-    kt = ensure_tree(WORK, 'linux-6.12.112', DL + '/linux-6.12.112.tar.xz')
-    kdirs = [GENERIC + '/backport-6.12', GENERIC + '/pending-6.12',
-             GENERIC + '/hack-6.12', PATCHES]
+    kt = ensure_tree(WORK, 'linux-' + kver, '%s/linux-%s.tar.xz' % (DL, kver))
+    kdirs = [GENERIC + '/backport-' + mm, GENERIC + '/pending-' + mm,
+             GENERIC + '/hack-' + mm,
+             REPO + '/target/linux/qualcommax/patches-' + mm]
     print('== kernel chain ==')
     dk = process(kt, kdirs)
 
     # ---- mac80211 链 ----
-    bt = ensure_tree(WORK, 'backports-6.18.55', DL + '/backports-6.18.55.tar.zst')
+    bt = ensure_tree(WORK, 'backports-' + bver, '%s/backports-%s.tar.zst' % (DL, bver))
     dirs = ['build', 'subsys', 'ath', 'ath5k', 'ath9k', 'ath10k', 'ath11k',
             'ath12k', 'rt2x00', 'mt7601u', 'mwl', 'brcm', 'rtl']
     mdirs = [MAC + '/' + d for d in dirs]
