@@ -50,7 +50,7 @@ def ensure_tree(work, name, tarball):
     return tree
 
 def replace_file_section(patch, fname, newdiff):
-    """Replace everything between '--- a/<fname>' and the next '--- ' or EOF."""
+    """Replace everything between '--- a/<fname>' and the next file section."""
     lines = open(patch, encoding='utf-8', errors='replace').read().split('\n')
     start = None
     for i, l in enumerate(lines):
@@ -61,8 +61,10 @@ def replace_file_section(patch, fname, newdiff):
         print('  ! section not found:', fname)
         return False
     end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if lines[j].startswith('--- '):
+    for j in range(start + 2, len(lines)):
+        # 真正的节边界: '--- <path>' 且下一行是 '+++ <path>'
+        if lines[j].startswith('--- ') and j + 1 < len(lines) \
+                and lines[j + 1].startswith('+++ '):
             end = j
             break
     # 新段: --- a/f / +++ b/f / diff内容(去头)
