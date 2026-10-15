@@ -92,14 +92,23 @@ untar() { # untar <archive> <dest-dir>
 	esac
 }
 
-resolve_source() { # resolve_source <name> <makefile-like hint...> -> echoes archive path
+resolve_source() { # resolve_source <name> <glob hint...> -> echoes archive path
 	local name=$1; shift
-	local ar
+	local ar pat
 	if [ $# -gt 0 ]; then
-		for ar in "$DL"/"$1"; do [ -f "$ar" ] && { echo "$ar"; return; } ; done
+		for pat in "$@"; do
+			for ar in "$DL"/$pat; do [ -f "$ar" ] && { echo "$ar"; return; }; done
+		done
 	fi
-	ar=$(ls -1 "$DL/$name"-*.tar.* 2>/dev/null | sort | tail -1)
-	[ -n "$ar" ] && { echo "$ar"; return; }
+	local cands
+	cands=$(ls -1 "$DL/$name"-*.tar.* 2>/dev/null)
+	if [ -n "$cands" ]; then
+		if [ "$(printf '%s\n' "$cands" | wc -l)" -gt 1 ]; then
+			log "warn: $name: multiple dl/ candidates, picking newest; pass a Makefile hint if wrong"
+		fi
+		echo "$(printf '%s\n' "$cands" | sort | tail -1)"
+		return
+	fi
 	echo "" # not found
 }
 
@@ -142,7 +151,7 @@ scan_log() { # scan_log <log> <chain-label> ; sets FAIL_FUZZ=1 if fuzz found
 check_kernel() {
 	local ver point full ar tree
 	ver=$(grep -oP '^KERNEL_PATCHVER:=\K.*' "$REPO/target/linux/$TARGET/Makefile")
-	point=$(grep -oP "^LINUX_VERSION-$ver = \K.*" "$REPO/include/kernel-$ver")
+	point=$(grep -oP "^LINUX_VERSION-$ver = \K.*" "$REPO/target/linux/generic/kernel-$ver" 2>/dev/null || grep -oP "^LINUX_VERSION-$ver = \K.*" "$REPO/include/kernel-$ver")
 	full="$ver$point"
 	ar=$(resolve_source "linux-$full" "linux-$full.tar.xz")
 	if [ -z "$ar" ]; then log "kernel: source dl/linux-$full.tar.* not found"; return 1; fi
@@ -200,7 +209,8 @@ check_pkgs() {
 		mf=$REPO/package/kernel/$pkg/Makefile
 		if [ ! -f "$mf" ]; then log "pkgs: $pkg has no Makefile"; rc=1; continue; fi
 		ver=$(grep -oP '^PKG_VERSION:=\K.*' "$mf" | head -1)
-		ar=$(resolve_source "$pkg")
+		d=$(grep -oP '^PKG_SOURCE_DATE:=\K.*' "$mf" | head -1 | tr '-' '.')
+		ar=$(resolve_source "$pkg" ${ver:+"$pkg-$ver*.tar.*"} ${d:+"$pkg-$d*.tar.*"})
 		if [ -z "$ar" ]; then log "pkgs: $pkg source not found in dl/"; rc=1; continue; fi
 		log "pkgs: $pkg from $(basename "$ar")"
 		tree=$WORK/$pkg
