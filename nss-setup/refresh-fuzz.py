@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+# refresh-fuzz.py -- regenerate NSS patch hunks so they apply with ZERO fuzz.
+#
+# Walks the same chain order as check-patches.sh, applying each patch to the
+# pristine source with --fuzz=0. When a patch only applies with fuzz, the
+# tree still ends up in the correct semantic state, so the patch's file
+# section is regenerated from a before/after diff taken at the exact chain
+# position. Afterwards all hunks anchor exactly.
+#
+# Usage: refresh-fuzz.py <workdir>
+#   <workdir> must contain the pristine trees (linux-6.12.112/,
+#   backports-6.18.55/) -- e.g. a check-patches.sh run directory.
+
+import os, re, shutil, subprocess, sys
+
+WORK = os.path.abspath(sys.argv[1])
+REPO = os.path.abspath(os.path.dirname(os.path.abspath(__file__)) + '/..')
+PATCHES = REPO + '/target/linux/qualcommax/patches-6.12'
+GENERIC = REPO + '/target/linux/generic'
+MAC = REPO + '/package/kernel/mac80211/patches'
+
+def run(cmd, cwd=None, check=False):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(cmd, r.stdout, r.stderr)
+    return r
+
+def files_in(patch):
+    fs = []
+    for l in open(patch, encoding='utf-8', errors='replace'):
+        m = re.match(r'^\+\+\+ b/(.+)$', l)
+        if m and m.group(1) not in fs:
+            fs.append(m.group(1))
+    return fs
+
+def ensure_tree(work, name, tarball):
+    tree = os.path.join(work, name)
+    if os.path.isdir(tree):
+        return tree
+    print('解压', tarball)
+    os.makedirs(tree, exist_ok=True)
+    if tarball.endswith('.zst'):
+        zst = REPO + '/staging_dir/host/bin/zstd'
+        if not os.path.exists(zst):
+            zst = 'zstd'
+        run(['tar', '-xf', tarball, '-C', tree, '--strip-components=1',
+             '-I', zst], check=True)
+    else:
+        run(['tar', '-xf', tarball, '-C', tree, '--strip-components=1'], check=True)
+    return tree
+
+def replace_file_section(patch, fname, newdiff):
+    """Replace everything between '--- a/<fname>' and the next '--- ' or EOF."""
+    lines = open(patch, encoding='utf-8', errors='replace').read().split('\n')
+    start = None
+    for i, l in enumerate(lines):
+        if l == '--- a/%s' % fname:
+            start = i
+            break
+    if start is None:
+        print('  ! section not found:', fname)
+        return False
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith('--- '):
+            end = j
+            break
+    # 新段: --- a/f / +++ b/f / diff内容(去头)
+    body = [l for l in newdiff.split('\n')]
+    # 去掉 diff 自带头两行(---/+++),以及可能的 "diff --git" 行
+    while body and (body[0].startswith('--- ') or body[0].startswith('+++ ')
+                    or body[0].startswith('diff ') or body[0].startswith('index ')
+                    or body[0] == ''):
+        body.pop(0)
+    newsec = ['--- a/%s' % fname, '+++ b/%s' % fname] + body
+    lines[start:end] = newsec
+    open(patch, 'w', encoding='utf-8').write('\n'.join(lines))
+    return True
+
+def process(tree, chain_dirs):
+    dirty = []
+    for pdir in chain_dirs:
+        if not os.path.isdir(pdir):
+            continue
+        patches = sorted(
+            (f for f in os.listdir(pdir) if f.endswith('.patch')),
+            key=lambda s: s.encode())
+        for pf in patches:
+            patch = os.path.join(pdir, pf)
+            rel = os.path.relpath(patch, REPO)
+            fs = files_in(patch)
+            # 快照
+            snap = {}
+            for f in fs:
+                fp = os.path.join(tree, f)
+                snap[f] = open(fp, encoding='utf-8', errors='replace').read() \
+                    if os.path.exists(fp) else None
+            # 先试零 fuzz
+            r = run(['patch', '-p1', '-d', tree, '--fuzz=0', '--no-backup-if-mismatch',
+                     '-i', patch])
+            if r.returncode == 0:
+                continue
+            # 还原快照(dry-run 失败可能有部分写入?patch 原子性较好,但保险起见)
+            for f, content in snap.items():
+                fp = os.path.join(tree, f)
+                if content is None:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                else:
+                    os.makedirs(os.path.dirname(fp), exist_ok=True)
+                    open(fp, 'w', encoding='utf-8').write(content)
+            # 清理失败遗留的 .rej
+            for root, _, fs2 in os.walk(tree):
+                for f2 in fs2:
+                    if f2.endswith(('.rej', '.orig')):
+                        os.remove(os.path.join(root, f2))
+            # 带 fuzz 应用
+            r2 = run(['patch', '-p1', '-d', tree, '--no-backup-if-mismatch', '-i', patch])
+            if r2.returncode != 0:
+                print('  !! 真实失败(需手工处理):', rel)
+                print(r2.stdout[-800:], r2.stderr[-400:])
+                dirty.append(patch)
+                continue
+            if ' with fuzz ' not in r2.stdout:
+                continue
+            # 有 fuzz:用快照 vs 当前树重新生成涉及文件的段
+            print('  ~ regen:', pf)
+            for f in fs:
+                fp = os.path.join(tree, f)
+                before = os.path.join(WORK, '.before', f)
+                after = os.path.join(WORK, '.after', f)
+                os.makedirs(os.path.dirname(before), exist_ok=True)
+                os.makedirs(os.path.dirname(after), exist_ok=True)
+                open(before, 'w', encoding='utf-8').write(snap[f] or '')
+                open(after, 'w', encoding='utf-8').write(
+                    open(fp, encoding='utf-8', errors='replace').read()
+                    if os.path.exists(fp) else '')
+                d = run(['diff', '-u', before, after])
+                if d.stdout:
+                    if replace_file_section(patch, f, d.stdout):
+                        dirty.append(patch)
+                    else:
+                        dirty.append(patch + ' (section miss!)')
+                # 文件不存在于 after(disppeared)的情形极少,暂不处理
+    return dirty
+
+def main():
+    DL = REPO + '/dl'
+    # ---- 内核链 ----
+    kt = ensure_tree(WORK, 'linux-6.12.112', DL + '/linux-6.12.112.tar.xz')
+    kdirs = [GENERIC + '/backport-6.12', GENERIC + '/pending-6.12',
+             GENERIC + '/hack-6.12', PATCHES]
+    print('== kernel chain ==')
+    dk = process(kt, kdirs)
+
+    # ---- mac80211 链 ----
+    bt = ensure_tree(WORK, 'backports-6.18.55', DL + '/backports-6.18.55.tar.zst')
+    dirs = ['build', 'subsys', 'ath', 'ath5k', 'ath9k', 'ath10k', 'ath11k',
+            'ath12k', 'rt2x00', 'mt7601u', 'mwl', 'brcm', 'rtl']
+    mdirs = [MAC + '/' + d for d in dirs]
+    nss = run(['grep', '-oP', r'^NSS_PATCH:=\s*\K.*',
+               REPO + '/package/kernel/mac80211/Makefile']).stdout.strip()
+    for d in nss.split():
+        mdirs.append(MAC + '/nss/' + d)
+    print('== mac80211 chain ==')
+    dm = process(bt, mdirs)
+
+    print('\n== 受影响补丁 ==')
+    for p in dict.fromkeys(dk + dm):
+        print(' ', os.path.relpath(p, REPO))
+
+if __name__ == '__main__':
+    main()
